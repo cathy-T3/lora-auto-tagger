@@ -1,0 +1,16 @@
+{
+  "name": "flux-tagger",
+  "version": "1.0.0",
+  "description": "FLUX.1 [dev] 训练数据本地打标工具",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "dependencies": {
+    "archiver": "^7.0.1",
+    "express": "^4.21.0",
+    "multer": "^1.4.5-lts.1",
+    "sharp": "^0.33.5"
+  }
+}

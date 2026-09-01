@@ -1,0 +1,355 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>FLUX Tagger - 训练数据打标工具</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <!-- 登录界面 -->
+  <div class="login-overlay" id="loginOverlay">
+    <div class="login-box">
+      <h1 class="login-logo">FLUX Tagger</h1>
+      <p class="login-sub">训练数据打标工具 · 请登录后使用</p>
+      <div class="form-group">
+        <label>用户名</label>
+        <input type="text" id="loginUsername" placeholder="管理员填 admin，其他用户填自己的用户名" autocomplete="username">
+      </div>
+      <div class="form-group">
+        <label>密码</label>
+        <input type="password" id="loginPassword" placeholder="请输入密码" autocomplete="current-password">
+      </div>
+      <button class="btn btn-primary btn-block" onclick="doLogin()">登 录</button>
+      <p class="login-error" id="loginError"></p>
+    </div>
+  </div>
+
+  <!-- 顶部导航栏 -->
+  <header class="header">
+    <div class="header-left">
+      <h1 class="logo">FLUX Tagger</h1>
+      <span class="subtitle">FLUX.1 [dev] 训练数据打标工具</span>
+    </div>
+    <div class="header-right">
+      <div class="api-status" id="apiStatus">
+        <span class="status-dot" id="statusDot"></span>
+        <span id="statusText">未配置</span>
+      </div>
+      <span class="user-badge" id="userBadge"></span>
+      <button class="btn btn-icon" onclick="openSettings()" title="设置">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <circle cx="12" cy="12" r="3"/>
+          <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
+        </svg>
+      </button>
+      <button class="btn btn-icon" onclick="doLogout()" title="退出登录">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/>
+        </svg>
+      </button>
+    </div>
+  </header>
+
+  <!-- 主体布局 -->
+  <div class="main-layout">
+    <!-- 侧边栏：项目管理 -->
+    <aside class="sidebar" id="sidebar">
+      <div class="sidebar-header">
+        <h2>项目列表</h2>
+        <button class="btn btn-primary btn-sm" onclick="openNewProject()">+ 新建项目</button>
+      </div>
+      <div class="project-list" id="projectList">
+        <div class="empty-state">
+          <p>暂无项目</p>
+          <p class="hint">点击「新建项目」开始</p>
+        </div>
+      </div>
+    </aside>
+
+    <!-- 主内容区 -->
+    <main class="content" id="content">
+      <!-- 空状态 -->
+      <div class="content-empty" id="contentEmpty">
+        <div class="welcome">
+          <h2>欢迎使用 FLUX Tagger</h2>
+          <p>FLUX.1 [dev] 训练数据本地打标工具</p>
+          <div class="features">
+            <div class="feature-item">
+              <span class="feature-icon">✂</span>
+              <span>自动裁剪 1024×1024</span>
+            </div>
+            <div class="feature-item">
+              <span class="feature-icon">中</span>
+              <span>中英文双语打标</span>
+            </div>
+            <div class="feature-item">
+              <span class="feature-icon">✓</span>
+              <span>智能验证核查</span>
+            </div>
+            <div class="feature-item">
+              <span class="feature-icon">📁</span>
+              <span>项目分组管理</span>
+            </div>
+            <div class="feature-item">
+              <span class="feature-icon">⬇</span>
+              <span>一键导出训练集</span>
+            </div>
+          </div>
+          <p class="start-hint">← 请先在左侧创建或选择项目</p>
+        </div>
+      </div>
+
+      <!-- 项目内容 -->
+      <div class="content-active" id="contentActive" style="display:none;">
+        <!-- 项目工具栏 -->
+        <div class="toolbar">
+          <div class="toolbar-info">
+            <h2 id="projectTitle">项目名称</h2>
+            <span class="project-meta" id="projectMeta"></span>
+          </div>
+          <div class="toolbar-actions">
+            <button class="btn btn-secondary btn-sm" onclick="openProjectSettings()" title="项目设置">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/><circle cx="5" cy="12" r="1"/></svg>
+            </button>
+            <label class="btn btn-primary btn-sm">
+              上传图片
+              <input type="file" multiple accept="image/*" style="display:none" id="fileInput" onchange="handleUpload(this)">
+            </label>
+            <button class="btn btn-secondary btn-sm" onclick="autoCaptionAll()" id="btnAutoCaptionAll" disabled>
+              全部打标
+            </button>
+            <button class="btn btn-secondary btn-sm" onclick="verifyAll()" id="btnVerifyAll" disabled>
+              全部验证
+            </button>
+            <button class="btn btn-success btn-sm" onclick="exportProject()" id="btnExport" disabled>
+              导出
+            </button>
+          </div>
+        </div>
+
+        <!-- 统计栏 -->
+        <div class="stats-bar" id="statsBar">
+          <div class="stat-item">
+            <span class="stat-label">总图片</span>
+            <span class="stat-value" id="statTotal">0</span>
+          </div>
+          <div class="stat-item">
+            <span class="stat-label">已打标</span>
+            <span class="stat-value" id="statCaptioned">0</span>
+          </div>
+          <div class="stat-item stat-verified">
+            <span class="stat-label">已验证</span>
+            <span class="stat-value" id="statVerified">0</span>
+          </div>
+          <div class="stat-item stat-uncertain">
+            <span class="stat-label">不确定</span>
+            <span class="stat-value" id="statUncertain">0</span>
+          </div>
+          <div class="stat-item stat-error">
+            <span class="stat-label">有错误</span>
+            <span class="stat-value" id="statError">0</span>
+          </div>
+          <div class="stat-item stat-needs-fix">
+            <span class="stat-label">待人工修</span>
+            <span class="stat-value" id="statNeedsFix">0</span>
+          </div>
+        </div>
+
+        <!-- 筛选/过滤栏 -->
+        <div class="filter-bar" id="filterBar">
+          <span class="filter-label">筛选:</span>
+          <select id="filterStatus">
+            <option value="all">全部</option>
+            <option value="pending">未验证</option>
+            <option value="uncertain">不确定</option>
+            <option value="error">有错误</option>
+            <option value="verified">已验证</option>
+            <option value="missing-part">⚠ 缺部件（需人工补）</option>
+          </select>
+          <select id="filterSort">
+            <option value="default">默认排序</option>
+            <option value="number-asc">按文件名 ↑</option>
+            <option value="number-desc">按文件名 ↓</option>
+            <option value="status">按问题优先级</option>
+          </select>
+          <span class="filter-tip" id="filterTip"></span>
+        </div>
+
+        <!-- 上传区域（拖放） -->
+        <div class="upload-zone" id="uploadZone">
+          <p>拖放图片到此处，或点击「上传图片」按钮</p>
+          <p class="hint">支持 JPG / PNG / WebP / BMP，自动裁剪为 1024×1024</p>
+        </div>
+
+        <!-- 图片网格 -->
+        <div class="image-grid" id="imageGrid"></div>
+      </div>
+    </main>
+  </div>
+
+  <!-- 设置弹窗 -->
+  <div class="modal-overlay" id="settingsModal" style="display:none;">
+    <div class="modal">
+      <div class="modal-header">
+        <h3>全局设置</h3>
+        <button class="btn-close" onclick="closeModal('settingsModal')">✕</button>
+      </div>
+      <div class="modal-body">
+        <div class="form-group">
+          <label>API 地址 (Base URL)</label>
+          <input type="text" id="settingsApiUrl" placeholder="https://api.openai.com/v1">
+          <small>支持 OpenAI 兼容 API（如 OpenAI / Azure / Ollama / LM Studio 等）</small>
+        </div>
+        <div class="form-group">
+          <label>API Key</label>
+          <input type="password" id="settingsApiKey" placeholder="sk-...">
+        </div>
+        <div class="form-group">
+          <label>视觉模型名称</label>
+          <input type="text" id="settingsModel" placeholder="gpt-4o">
+          <small>需支持图片输入的视觉模型（如 gpt-4o, gpt-4-vision-preview, qwen-vl-max 等）</small>
+        </div>
+        <div class="form-group">
+          <label>默认裁剪模式</label>
+          <select id="settingsCropMode">
+            <option value="attention">智能裁剪（基于显著性检测，推荐）</option>
+            <option value="center">中心裁剪</option>
+            <option value="contain">包含模式（填充黑边，保留完整画面）</option>
+          </select>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-secondary" onclick="closeModal('settingsModal')">取消</button>
+        <button class="btn btn-primary" onclick="saveSettings()">保存设置</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 新建项目弹窗 -->
+  <div class="modal-overlay" id="newProjectModal" style="display:none;">
+    <div class="modal">
+      <div class="modal-header">
+        <h3>新建项目</h3>
+        <button class="btn-close" onclick="closeModal('newProjectModal')">✕</button>
+      </div>
+      <div class="modal-body">
+        <div class="form-group">
+          <label>项目名称 *</label>
+          <input type="text" id="newProjectName" placeholder="例如：人物训练集">
+        </div>
+        <div class="form-group">
+          <label>项目描述</label>
+          <textarea id="newProjectDesc" rows="2" placeholder="可选描述"></textarea>
+        </div>
+        <div class="form-group">
+          <label>触发词 (Trigger Word)</label>
+          <input type="text" id="newProjectTrigger" placeholder="例如：sks person">
+          <small>LoRA 训练用的触发词，导出时自动添加到标语前</small>
+        </div>
+        <div class="form-group">
+          <label>打标模板</label>
+          <select id="newProjectTemplate">
+            <option value="general">通用模板（自然语言描述，适合人物/风景/艺术）</option>
+            <option value="glc-car">汽车标签模板（标签式，汽车车型LoRA训练专用）</option>
+          </select>
+          <small>选择 汽车标签模板 后，触发词建议填车型名，打标会按规范输出标签格式</small>
+        </div>
+        <div class="form-group">
+          <label>裁剪模式</label>
+          <select id="newProjectCrop">
+            <option value="attention">智能裁剪（推荐）</option>
+            <option value="center">中心裁剪</option>
+            <option value="contain">包含模式（填充黑边）</option>
+          </select>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-secondary" onclick="closeModal('newProjectModal')">取消</button>
+        <button class="btn btn-primary" onclick="createProject()">创建项目</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 项目设置弹窗 -->
+  <div class="modal-overlay" id="projectSettingsModal" style="display:none;">
+    <div class="modal">
+      <div class="modal-header">
+        <h3>项目设置</h3>
+        <button class="btn-close" onclick="closeModal('projectSettingsModal')">✕</button>
+      </div>
+      <div class="modal-body">
+        <div class="form-group">
+          <label>项目名称</label>
+          <input type="text" id="editProjectName">
+        </div>
+        <div class="form-group">
+          <label>项目描述</label>
+          <textarea id="editProjectDesc" rows="2"></textarea>
+        </div>
+        <div class="form-group">
+          <label>触发词 (Trigger Word)</label>
+          <input type="text" id="editProjectTrigger">
+        </div>
+        <div class="form-group">
+          <label>打标模板</label>
+          <select id="editProjectTemplate">
+            <option value="general">通用模板</option>
+            <option value="glc-car">汽车标签模板（标签式）</option>
+          </select>
+        </div>
+        <div class="form-group">
+          <label>裁剪模式</label>
+          <select id="editProjectCrop">
+            <option value="attention">智能裁剪（推荐）</option>
+            <option value="center">中心裁剪</option>
+            <option value="contain">包含模式（填充黑边）</option>
+          </select>
+        </div>
+        <hr>
+        <div class="form-group">
+          <button class="btn btn-danger btn-sm" onclick="deleteProject()">删除此项目</button>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-secondary" onclick="closeModal('projectSettingsModal')">取消</button>
+        <button class="btn btn-primary" onclick="updateProject()">保存</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 图片详情弹窗 -->
+  <div class="modal-overlay" id="imageDetailModal" style="display:none;">
+    <div class="modal modal-large">
+      <div class="modal-header">
+        <h3 id="imageDetailTitle">图片详情</h3>
+        <button class="btn-close" onclick="closeModal('imageDetailModal')">✕</button>
+      </div>
+      <div class="modal-body" id="imageDetailBody">
+        <!-- 动态内容 -->
+      </div>
+    </div>
+  </div>
+
+  <!-- 进度弹窗 -->
+  <div class="modal-overlay" id="progressModal" style="display:none;">
+    <div class="modal modal-small">
+      <div class="modal-body">
+        <div class="progress-content">
+          <h3 id="progressTitle">处理中...</h3>
+          <div class="progress-bar-container">
+            <div class="progress-bar" id="progressBar" style="width: 0%"></div>
+          </div>
+          <p id="progressText">0 / 0</p>
+          <div class="progress-log" id="progressLog"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 通知 -->
+  <div class="toast-container" id="toastContainer"></div>
+
+  <script src="app.js"></script>
+</body>
+</html>

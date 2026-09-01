@@ -1,0 +1,26 @@
+# 依赖
+node_modules/
+
+# 敏感配置（含 API Key / 密码，切勿提交）
+settings.json
+auth.json
+
+# 用户数据与项目图片（私有，不提交）
+projects/
+
+# 打包产物
+*.zip
+knowledge_base/
+
+# 知识库文档（含私有项目记录，不公开）
+KNOWLEDGE_BASE.md
+public/knowledge.html
+
+# 一次性工作脚本
+recaption_missing.js
+recaption_serial.js
+rename_trigger.js
+
+# 系统文件
+.DS_Store
+*.log
