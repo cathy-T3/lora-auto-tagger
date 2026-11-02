@@ -5,6 +5,9 @@ node_modules/
 settings.json
 auth.json
 
+# 部署用 SSH 密钥
+.ssh_deploy/
+
 # 用户数据与项目图片（私有，不提交）
 projects/
 

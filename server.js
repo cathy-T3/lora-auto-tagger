@@ -5,6 +5,8 @@ const archiver = require('archiver');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const os = require('os');
+const { execFileSync } = require('child_process');
 
 const app = express();
 const PORT = 3000;
@@ -111,11 +113,6 @@ const GLC_CAR_PRESETS = {
     'left rear 45 view': '左后45度视角',
     'right rear 45 view': '右后45度视角',
     'rear view': '后视图',
-    // 更细的角度（按用户实际数据补充）
-    'left rear 24 view': '左后24度视角',
-    'right rear 24 view': '右后24度视角',
-    'left front 24 view': '左前24度视角',
-    'right front 24 view': '右前24度视角',
   },
   colors: {
     'black painted': '黑色涂装',
@@ -136,7 +133,7 @@ const GLC_CAR_PRESETS = {
     'front wheel': '前车轮',
     'rear wheel': '后车轮',
     'rearview mirror': '后视镜',
-    'front grille': '前中网',
+    'front grille': '前格栅',
     'motor vehicle': '机动车',
   },
 };
@@ -295,6 +292,7 @@ app.get('/api/projects', (req, res) => {
         createdAt: meta.createdAt,
         imageCount: meta.images ? meta.images.length : 0,
         triggerWord: meta.triggerWord || '',
+        carName: meta.carName || '',
         cropMode: meta.cropMode || 'attention',
         captionTemplate: meta.captionTemplate || 'general',
         ownerId: meta.ownerId || '',
@@ -309,7 +307,7 @@ app.get('/api/projects', (req, res) => {
 // 创建项目
 app.post('/api/projects', (req, res) => {
   try {
-    const { name, description, triggerWord, cropMode, captionTemplate } = req.body;
+    const { name, description, triggerWord, carName, cropMode, captionTemplate } = req.body;
     if (!name || !name.trim()) {
       return res.status(400).json({ error: '项目名称不能为空' });
     }
@@ -318,10 +316,10 @@ app.post('/api/projects', (req, res) => {
     fs.mkdirSync(path.join(projectDir, 'originals'), { recursive: true });
     fs.mkdirSync(path.join(projectDir, 'cropped'), { recursive: true });
 
-    // 如果使用 GLC 模板但未设置触发词，默认用 GLC
+    // 汽车模板下未填触发词时，优先用车名，再退回项目名称（触发词需与项目名一致）
     let tw = triggerWord || '';
     if (captionTemplate === 'glc-car' && !tw) {
-      tw = 'GLC';
+      tw = (carName || '').trim() || name.trim();
     }
 
     const meta = {
@@ -329,6 +327,7 @@ app.post('/api/projects', (req, res) => {
       name: name.trim(),
       description: description || '',
       triggerWord: tw,
+      carName: (carName || '').trim(),
       cropMode: cropMode || 'attention',
       captionTemplate: captionTemplate || 'general',
       createdAt: new Date().toISOString(),
@@ -368,10 +367,11 @@ app.delete('/api/projects/:id', (req, res) => {
 app.put('/api/projects/:id', (req, res) => {
   const meta = getAccessibleProject(req, res);
   if (!meta) return;
-  const { name, description, triggerWord, cropMode, captionTemplate } = req.body;
+  const { name, description, triggerWord, carName, cropMode, captionTemplate } = req.body;
   if (name !== undefined) meta.name = name;
   if (description !== undefined) meta.description = description;
   if (triggerWord !== undefined) meta.triggerWord = triggerWord;
+  if (carName !== undefined) meta.carName = (carName || '').trim();
   if (cropMode !== undefined) meta.cropMode = cropMode;
   if (captionTemplate !== undefined) meta.captionTemplate = captionTemplate;
   saveProjectMeta(req.params.id, meta);
@@ -417,81 +417,142 @@ const upload = multer({
   limits: { fileSize: 50 * 1024 * 1024 }, // 50MB
 });
 
+// ============ 裁剪（统一规格：1024×1024 / 72 DPI / 主体居中） ============
+const CROP_SIZE = 1024;
+const CROP_DPI = 72;
+
+function cropPipeline(inputPath, cropMode = 'attention') {
+  let pipeline = sharp(inputPath);
+  if (cropMode === 'contain') {
+    pipeline = pipeline.resize(CROP_SIZE, CROP_SIZE, {
+      fit: 'contain',
+      background: { r: 255, g: 255, b: 255, alpha: 1 },
+    });
+  } else if (cropMode === 'center') {
+    pipeline = pipeline.resize(CROP_SIZE, CROP_SIZE, { fit: 'cover', position: 'center' });
+  } else {
+    // attention：按显著性裁剪，保证车体落在画面中间
+    pipeline = pipeline.resize(CROP_SIZE, CROP_SIZE, { fit: 'cover', position: 'attention' });
+  }
+  return pipeline.withMetadata({ density: CROP_DPI }).jpeg({ quality: 95, mozjpeg: true });
+}
+
+async function cropImageFile(originalPath, outputPath, cropMode = 'attention', learnedPattern = null) {
+  if (cropMode === 'learned' && learnedPattern) {
+    try {
+      await cropWithLearnedPattern(originalPath, outputPath, learnedPattern);
+      return;
+    } catch (e) {
+      console.error('学习裁剪失败，回退智能裁剪:', e.message);
+    }
+  }
+  try {
+    await cropPipeline(originalPath, cropMode === 'learned' ? 'attention' : cropMode).toFile(outputPath);
+  } catch (e) {
+    console.error('裁剪失败，回退中心裁剪:', e.message);
+    await sharp(originalPath)
+      .resize(CROP_SIZE, CROP_SIZE, { fit: 'cover', position: 'center' })
+      .withMetadata({ density: CROP_DPI })
+      .jpeg({ quality: 95 })
+      .toFile(outputPath);
+  }
+}
+
+// 从用户手动裁剪样本里学习裁剪习惯（取中位数，抗个别异常值）
+function computeLearnedCrop(meta) {
+  const samples = (meta.cropSamples || []).filter(s => typeof s.size === 'number').slice(-80);
+  if (samples.length < 5) return null;
+  const median = (arr) => {
+    const a = [...arr].sort((x, y) => x - y);
+    return a[Math.floor((a.length - 1) / 2)];
+  };
+  return {
+    size: median(samples.map(s => s.size)),
+    cx: median(samples.map(s => {
+      const aspect = s.aspect || 0.5625;
+      // size 相对短边：横图短边是高，竖图短边是宽
+      const half = aspect >= 1 ? s.size / (2 * aspect) : s.size / 2;
+      return s.x + half;
+    })),
+    cy: median(samples.map(s => {
+      const aspect = s.aspect || 0.5625;
+      const half = aspect >= 1 ? s.size / 2 : s.size * aspect / 2;
+      return s.y + half;
+    })),
+    samples: samples.length,
+  };
+}
+
+// 按学习到的规则裁剪：竖图用「满宽 + 水平居中 + 车在中间偏下」，横图仍走显著性裁剪
+async function cropWithLearnedPattern(originalPath, outputPath, pattern) {
+  const metadata = await sharp(originalPath).metadata();
+  const { width, height } = metadata;
+  if (width > height) {
+    await cropPipeline(originalPath, 'attention').toFile(outputPath);
+    return;
+  }
+  const short = Math.min(width, height);
+  const side = Math.max(32, Math.min(short, Math.round(short * pattern.size)));
+  const left = Math.max(0, Math.min(width - side, Math.round(pattern.cx * width - side / 2)));
+  const top = Math.max(0, Math.min(height - side, Math.round(pattern.cy * height - side / 2)));
+  await sharp(originalPath)
+    .extract({ left, top, width: side, height: side })
+    .resize(CROP_SIZE, CROP_SIZE, { fit: 'cover' })
+    .withMetadata({ density: CROP_DPI })
+    .jpeg({ quality: 95, mozjpeg: true })
+    .toFile(outputPath);
+}
+
+// 按需裁剪：图片还没裁剪时，在使用前补裁一次
+async function ensureCropped(meta, projectId, img) {
+  const croppedAbs = path.join(PROJECTS_DIR, projectId, img.croppedPath);
+  if (img.cropStatus !== 'uncropped' && fs.existsSync(croppedAbs)) return true;
+  await cropImageFile(
+    path.join(PROJECTS_DIR, projectId, img.originalPath),
+    croppedAbs,
+    meta.cropMode || 'attention',
+    meta.cropMode === 'learned' ? computeLearnedCrop(meta) : null
+  );
+  if (img.cropStatus === 'uncropped') img.cropStatus = 'pending';
+  return true;
+}
+
+// 登记一张已落在 originals 目录的图片（id 取自文件名）。先不裁剪，等用户手动触发
+async function registerImage(meta, projectId, originalAbsPath, originalName, fileSize) {
+  const imageId = path.basename(originalAbsPath, path.extname(originalAbsPath));
+  const metadata = await sharp(originalAbsPath).metadata();
+  const imageInfo = {
+    id: imageId,
+    originalName,
+    originalPath: path.join('originals', path.basename(originalAbsPath)),
+    croppedPath: path.join('cropped', imageId + '.jpg'),
+    originalSize: { width: metadata.width, height: metadata.height },
+    fileSize,
+    captionEn: '',
+    captionZh: '',
+    verificationStatus: 'pending', // pending | verified | uncertain | error
+    verificationConfidence: 0,
+    verificationNote: '',
+    cropStatus: 'uncropped', // uncropped | pending | ok | reject
+    shotType: '', // full（整车）| detail（特写）
+    screen: null, // AI 质检结果 { usable, shotType, issues, reason }
+    uploadedAt: new Date().toISOString(),
+  };
+  meta.images.push(imageInfo);
+  return imageInfo;
+}
+
 // 上传图片并自动裁剪
 app.post('/api/projects/:id/images', upload.array('images', 100), async (req, res) => {
   try {
     const meta = getAccessibleProject(req, res);
     if (!meta) return;
 
-    const cropMode = meta.cropMode || 'attention';
     const results = [];
 
     for (const file of req.files) {
-      const imageId = generateId();
-      const ext = path.extname(file.filename);
-      const croppedFilename = imageId + '.jpg';
-      const croppedPath = path.join(PROJECTS_DIR, req.params.id, 'cropped', croppedFilename);
-
-      // 裁剪到 1024×1024
-      try {
-        let pipeline = sharp(file.path);
-
-        if (cropMode === 'contain') {
-          // 包含模式：缩放到适合 1024×1024 内，然后填充背景
-          pipeline = pipeline.resize(1024, 1024, {
-            fit: 'contain',
-            background: { r: 0, g: 0, b: 0, alpha: 1 },
-          });
-        } else if (cropMode === 'center') {
-          // 中心裁剪
-          pipeline = pipeline.resize(1024, 1024, {
-            fit: 'cover',
-            position: 'center',
-          });
-        } else {
-          // attention 模式：智能裁剪（基于显著性）
-          pipeline = pipeline.resize(1024, 1024, {
-            fit: 'cover',
-            position: 'attention',
-          });
-        }
-
-        pipeline = pipeline.jpeg({ quality: 95, mozjpeg: true });
-        await pipeline.toFile(croppedPath);
-      } catch (e) {
-        console.error('裁剪失败:', file.filename, e.message);
-        // 如果 attention 失败，回退到 center
-        try {
-          await sharp(file.path)
-            .resize(1024, 1024, { fit: 'cover', position: 'center' })
-            .jpeg({ quality: 95 })
-            .toFile(croppedPath);
-        } catch (e2) {
-          console.error('回退裁剪也失败:', e2.message);
-          continue;
-        }
-      }
-
-      // 获取原始图片尺寸
-      const metadata = await sharp(file.path).metadata();
-
-      const imageInfo = {
-        id: imageId,
-        originalName: file.originalname,
-        originalPath: path.join('originals', file.filename),
-        croppedPath: path.join('cropped', croppedFilename),
-        originalSize: { width: metadata.width, height: metadata.height },
-        fileSize: file.size,
-        captionEn: '',
-        captionZh: '',
-        verificationStatus: 'pending', // pending | verified | uncertain | error
-        verificationConfidence: 0,
-        verificationNote: '',
-        uploadedAt: new Date().toISOString(),
-      };
-
-      meta.images.push(imageInfo);
-      results.push(imageInfo);
+      const info = await registerImage(meta, req.params.id, file.path, file.originalname, file.size);
+      if (info) results.push(info);
     }
 
     saveProjectMeta(req.params.id, meta);
@@ -499,6 +560,64 @@ app.post('/api/projects/:id/images', upload.array('images', 100), async (req, re
   } catch (e) {
     console.error('上传错误:', e);
     res.status(500).json({ error: e.message });
+  }
+});
+
+// 上传图包（zip）：解压后批量导入并自动裁剪
+const IMAGE_EXTS = new Set(['.jpg', '.jpeg', '.png', '.webp', '.bmp', '.tiff']);
+
+const zipStorage = multer.diskStorage({
+  destination: (req, file, cb) => cb(null, os.tmpdir()),
+  filename: (req, file, cb) =>
+    cb(null, 'fluxzip-' + Date.now() + '-' + Math.random().toString(16).slice(2) + '.zip'),
+});
+const uploadZip = multer({ storage: zipStorage, limits: { fileSize: 1024 * 1024 * 1024 } });
+
+app.post('/api/projects/:id/images/zip', uploadZip.single('archive'), async (req, res) => {
+  let tmpDir = null;
+  try {
+    const meta = getAccessibleProject(req, res);
+    if (!meta) return;
+    if (!req.file) return res.status(400).json({ error: '未收到压缩包' });
+
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'fluxzip-'));
+    try {
+      execFileSync('unzip', ['-qq', '-o', req.file.path, '-d', tmpDir], { stdio: 'ignore' });
+    } catch (e) {
+      return res.status(400).json({ error: '压缩包解压失败（仅支持 zip 格式）' });
+    }
+
+    const found = [];
+    (function walk(dir) {
+      for (const name of fs.readdirSync(dir)) {
+        const p = path.join(dir, name);
+        const st = fs.statSync(p);
+        if (st.isDirectory()) walk(p);
+        else if (IMAGE_EXTS.has(path.extname(name).toLowerCase()) && !name.startsWith('._')) found.push(p);
+      }
+    })(tmpDir);
+
+    if (!found.length) return res.status(400).json({ error: '压缩包内没有找到支持的图片' });
+
+    const images = [];
+    const originalsDir = path.join(PROJECTS_DIR, req.params.id, 'originals');
+    fs.mkdirSync(originalsDir, { recursive: true });
+
+    for (const src of found) {
+      const dest = path.join(originalsDir, generateId() + path.extname(src).toLowerCase());
+      fs.copyFileSync(src, dest);
+      const info = await registerImage(meta, req.params.id, dest, path.basename(src), fs.statSync(dest).size);
+      if (info) images.push(info);
+    }
+
+    saveProjectMeta(req.params.id, meta);
+    res.status(201).json({ count: images.length, total: found.length, images });
+  } catch (e) {
+    console.error('图包上传失败:', e);
+    res.status(500).json({ error: e.message });
+  } finally {
+    try { if (req.file && fs.existsSync(req.file.path)) fs.unlinkSync(req.file.path); } catch {}
+    try { if (tmpDir) fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
   }
 });
 
@@ -512,6 +631,9 @@ app.get('/api/projects/:id/images/:imageId/file', (req, res) => {
   }
   const filePath = path.join(PROJECTS_DIR, req.params.id, img.croppedPath);
   if (!fs.existsSync(filePath)) {
+    // 还没裁剪时先显示原图
+    const originalPath = path.join(PROJECTS_DIR, req.params.id, img.originalPath);
+    if (fs.existsSync(originalPath)) return res.sendFile(originalPath);
     return res.status(404).json({ error: '文件不存在' });
   }
   res.sendFile(filePath);
@@ -586,30 +708,48 @@ async function callVisionAPI(imagePath, prompt, settings) {
   return data.choices[0].message.content;
 }
 
+// 统一涂装标签：本数据集约定所有车都是白色涂装（避免 AI 把白车写成银色）
+function normalizeCarColors(text) {
+  if (!text) return text;
+  return text
+    .replace(/\b(black|blue|silver|gray|grey|red|green|yellow)\s+painted\b/gi, 'white painted')
+    .replace(/(黑色|蓝色|银色|灰色|红色|绿色|黄色)涂装/g, '白色涂装')
+    .replace(/white painted,\s*white painted/g, 'white painted')
+    .replace(/白色涂装，?\s*白色涂装/g, '白色涂装')
+    // 统一中文用词与分隔符
+    .replace(/机动车辆/g, '机动车')
+    .replace(/门把手/g, '车门把手')
+    .replace(/车车门把手/g, '车门把手')
+    .replace(/[，、]/g, ', ');
+}
+
 // 根据项目模板生成打标 Prompt
-function buildCaptionPrompt(template, triggerWord) {
+function buildCaptionPrompt(template, triggerWord, carName) {
   if (template === 'glc-car') {
     const tw = triggerWord || 'GLC';
+    const cn = (carName || '').trim();
+    const carRef = cn ? `${cn} (model name "${cn}", trigger abbreviation "${tw}")` : tw;
+    const nameplateExample = cn || 'GT';
     return `You are an expert image tagger for car LoRA training (FLUX.1 diffusion model).
-You are tagging images of a ${tw} car for LoRA training. Be DETAILED about every visible car part.
+You are tagging images of a ${carRef} car for LoRA training. Be DETAILED about every visible car part.
 
 STRICT RULES (打标规范):
 1. First tag: trigger word "${tw}" — always at the very start.
 2. Always include "motor vehicle" near the END (second-to-last or last position).
 3. If the image shows the whole car:
    - Use ONE view angle + ONE color painted, then ADD any visible car parts.
-   - Example: "${tw}, front view, silver painted, headlight, through daytime running light, car logo, front grille, motor vehicle"
+   - Example: "${tw}, front view, white painted, headlight, through daytime running light, car logo, front grille, motor vehicle"
 4. If the image is a closeup of a part:
    - Use color painted + the part(s).
-   - Example: "${tw}, silver painted, wheel, motor vehicle"
+   - Example: "${tw}, white painted, wheel, motor vehicle"
 
 VIEW ANGLES (use ONLY these exact strings):
 - front view, left front 45 view, right front 45 view
 - side view, left rear 45 view, right rear 45 view, rear view
-- left rear 24 view, right rear 24 view, left front 24 view, right front 24 view
 
 COLORS (use ONLY these exact strings with "painted" suffix):
 - black painted, blue painted, silver painted, white painted
+- COLOR RULE FOR THIS DATASET: every car is "white painted". ALWAYS output "white painted"; NEVER output black/blue/silver painted, even if the photo looks grey or silvery under certain light.
 
 CAR PARTS — IMPORTANT: tag every part that is CLEARLY VISIBLE in the image, not just closeups!
 - license plate, headlight, through daytime running light
@@ -646,7 +786,7 @@ OTHER RULES:
 - Do NOT describe background, lighting, weather, environment, or driver.
 - DISTINGUISHING car logo vs nameplate:
   * "car logo" = the manufacturer's emblem/badge on the front (e.g. round or stylized brand mark)
-  * "nameplate" = a small text/letter badge on the rear or side that displays the model name/version (e.g. "GT"). These are separate from the front logo.
+  * "nameplate" = a small text/letter badge on the rear or side that displays the model name/version (e.g. "${nameplateExample}"). These are separate from the front logo.
   * Tag both if visible. A car can have a car logo AND a nameplate on the same image.
 - Do NOT repeat the same tag twice.
 - Judge view angle by where the car's FRONT is facing (车头朝向哪边，那一边就是前):
@@ -657,7 +797,6 @@ OTHER RULES:
   * Rear visible with front pointing slightly left → left rear 45 view (rear-left side visible)
   * Rear visible with front pointing slightly right → right rear 45 view (rear-right side visible)
   * Rear faces you directly → rear view
-  * If the angle is shallower (24 degrees) instead of 45 → use the 24 view variant
 
 After tagging, provide a Chinese translation of each tag for human verification.
 
@@ -697,8 +836,11 @@ app.post('/api/projects/:id/images/:imageId/caption', async (req, res) => {
       return res.status(400).json({ error: '请先在设置中配置 API Key' });
     }
 
+    await ensureCropped(meta, req.params.id, img);
+    saveProjectMeta(req.params.id, meta);
+
     const imagePath = path.join(PROJECTS_DIR, req.params.id, img.croppedPath);
-    const prompt = buildCaptionPrompt(meta.captionTemplate || 'general', meta.triggerWord || '');
+    const prompt = buildCaptionPrompt(meta.captionTemplate || 'general', meta.triggerWord || '', meta.carName || '');
 
     const rawResponse = await callVisionAPI(imagePath, prompt, settings);
 
@@ -719,6 +861,10 @@ app.post('/api/projects/:id/images/:imageId/caption', async (req, res) => {
 
     img.captionEn = captions.english || '';
     img.captionZh = captions.chinese || '';
+    if ((meta.captionTemplate || 'general') === 'glc-car') {
+      img.captionEn = normalizeCarColors(img.captionEn);
+      img.captionZh = normalizeCarColors(img.captionZh);
+    }
     img.verificationStatus = 'pending';
 
     saveProjectMeta(req.params.id, meta);
@@ -748,6 +894,7 @@ app.post('/api/projects/:id/auto-caption-all', async (req, res) => {
     for (let i = 0; i < pendingImages.length; i++) {
       const img = pendingImages[i];
       try {
+        await ensureCropped(meta, req.params.id, img);
         const imagePath = path.join(PROJECTS_DIR, req.params.id, img.croppedPath);
 
         const prompt = `You are an expert image captioner for FLUX.1 diffusion model training data preparation.
@@ -783,6 +930,10 @@ Respond ONLY in this exact JSON format, no other text:
 
         img.captionEn = captions.english || '';
         img.captionZh = captions.chinese || '';
+        if ((meta.captionTemplate || 'general') === 'glc-car') {
+          img.captionEn = normalizeCarColors(img.captionEn);
+          img.captionZh = normalizeCarColors(img.captionZh);
+        }
         img.verificationStatus = 'pending';
         results.push({ id: img.id, status: 'success', image: img });
         successCount++;
@@ -835,6 +986,9 @@ app.post('/api/projects/:id/images/:imageId/verify', async (req, res) => {
     if (!settings.apiKey || settings.apiKey.includes('****')) {
       return res.status(400).json({ error: '请先在设置中配置 API Key' });
     }
+
+    await ensureCropped(meta, req.params.id, img);
+    saveProjectMeta(req.params.id, meta);
 
     const imagePath = path.join(PROJECTS_DIR, req.params.id, img.croppedPath);
 
@@ -918,6 +1072,7 @@ app.post('/api/projects/:id/verify-all', async (req, res) => {
 
     for (const img of toVerify) {
       try {
+        await ensureCropped(meta, req.params.id, img);
         const imagePath = path.join(PROJECTS_DIR, req.params.id, img.croppedPath);
 
         const prompt = `You are a quality assurance reviewer for AI training image captions.
@@ -996,13 +1151,18 @@ Respond ONLY in this exact JSON format:
 // ============ 导出 API ============
 
 // 导出项目为 ZIP
-app.get('/api/projects/:id/export', (req, res) => {
+app.get('/api/projects/:id/export', async (req, res) => {
   try {
     const meta = getAccessibleProject(req, res);
     if (!meta) return;
 
     const projectName = meta.name.replace(/[^\w\u4e00-\u9fa5\-_]/g, '_');
-    const zipFileName = `${projectName}_flux_training_data.zip`;
+    // type=all 图片+标词；images 只图片；captions 只标词
+    const exportType = ['images', 'captions'].includes(req.query.type) ? req.query.type : 'all';
+    const includeImages = exportType !== 'captions';
+    const includeCaptions = exportType !== 'images';
+    const suffix = exportType === 'images' ? '_images' : exportType === 'captions' ? '_captions' : '_flux_training_data';
+    const zipFileName = `${projectName}${suffix}.zip`;
 
     res.setHeader('Content-Type', 'application/zip');
     res.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(zipFileName)}`);
@@ -1017,6 +1177,15 @@ app.get('/api/projects/:id/export', (req, res) => {
     const projectDir = path.join(PROJECTS_DIR, req.params.id);
     const triggerWord = meta.triggerWord || '';
 
+    // 导出前把还没裁剪的图补裁（懒裁剪）
+    for (const img of meta.images) {
+      try {
+        await ensureCropped(meta, req.params.id, img);
+      } catch (e) {
+        console.error('导出补裁失败:', img.originalName, e.message);
+      }
+    }
+
     // 添加每张图片和对应的标语文件
     for (const img of meta.images) {
       const croppedFile = path.join(projectDir, img.croppedPath);
@@ -1025,50 +1194,57 @@ app.get('/api/projects/:id/export', (req, res) => {
         const ext = path.extname(img.croppedPath);
 
         // 添加图片
-        archive.file(croppedFile, { name: `${baseName}${ext}` });
+        if (includeImages) {
+          archive.file(croppedFile, { name: `${baseName}${ext}` });
+        }
 
         // 添加英文标语文件（FLUX 训练用）
-        let caption = img.captionEn || '';
-        if (triggerWord) {
-          caption = triggerWord + ' ' + caption;
+        if (includeCaptions) {
+          let caption = img.captionEn || '';
+          // 标语本身若已以触发词开头，就不再重复加
+          if (triggerWord && !caption.toLowerCase().startsWith(triggerWord.toLowerCase())) {
+            caption = triggerWord + ' ' + caption;
+          }
+          archive.append(caption, { name: `${baseName}.txt` });
         }
-        archive.append(caption, { name: `${baseName}.txt` });
       }
     }
 
-    // 添加汇总 JSON（包含中英文对照）
-    const summary = meta.images.map(img => ({
-      filename: path.basename(img.croppedPath),
-      captionEn: img.captionEn,
-      captionZh: img.captionZh,
-      verificationStatus: img.verificationStatus,
-      verificationConfidence: img.verificationConfidence,
-      verificationNote: img.verificationNote ? JSON.parse(img.verificationNote) : null,
-    }));
-    archive.append(JSON.stringify({
-      project: meta.name,
-      exportDate: new Date().toISOString(),
-      triggerWord: triggerWord,
-      totalImages: meta.images.length,
-      images: summary,
-    }, null, 2), { name: 'caption_summary.json' });
+    if (includeCaptions) {
+      // 添加汇总 JSON（包含中英文对照）
+      const summary = meta.images.map(img => ({
+        filename: path.basename(img.croppedPath),
+        captionEn: img.captionEn,
+        captionZh: img.captionZh,
+        verificationStatus: img.verificationStatus,
+        verificationConfidence: img.verificationConfidence,
+        verificationNote: img.verificationNote ? JSON.parse(img.verificationNote) : null,
+      }));
+      archive.append(JSON.stringify({
+        project: meta.name,
+        exportDate: new Date().toISOString(),
+        triggerWord: triggerWord,
+        totalImages: meta.images.length,
+        images: summary,
+      }, null, 2), { name: 'caption_summary.json' });
 
-    // 添加中英文对照 CSV
-    let csvContent = '\uFEFFfilename,english_caption,chinese_caption,verification_status,confidence,issues\n';
-    for (const img of meta.images) {
-      const filename = path.basename(img.croppedPath);
-      const en = (img.captionEn || '').replace(/"/g, '""');
-      const zh = (img.captionZh || '').replace(/"/g, '""');
-      let issues = '';
-      if (img.verificationNote) {
-        try {
-          const note = JSON.parse(img.verificationNote);
-          issues = (note.issues || []).join('; ').replace(/"/g, '""');
-        } catch (e) {}
+      // 添加中英文对照 CSV
+      let csvContent = '\uFEFFfilename,english_caption,chinese_caption,verification_status,confidence,issues\n';
+      for (const img of meta.images) {
+        const filename = path.basename(img.croppedPath);
+        const en = (img.captionEn || '').replace(/"/g, '""');
+        const zh = (img.captionZh || '').replace(/"/g, '""');
+        let issues = '';
+        if (img.verificationNote) {
+          try {
+            const note = JSON.parse(img.verificationNote);
+            issues = (note.issues || []).join('; ').replace(/"/g, '""');
+          } catch (e) {}
+        }
+        csvContent += `"${filename}","${en}","${zh}","${img.verificationStatus}","${img.verificationConfidence}","${issues}"\n`;
       }
-      csvContent += `"${filename}","${en}","${zh}","${img.verificationStatus}","${img.verificationConfidence}","${issues}"\n`;
+      archive.append(csvContent, { name: 'caption_bilingual.csv' });
     }
-    archive.append(csvContent, { name: 'caption_bilingual.csv' });
 
     archive.finalize();
   } catch (e) {
@@ -1088,24 +1264,246 @@ app.post('/api/projects/:id/images/:imageId/recrop', async (req, res) => {
 
     const cropMode = req.body.cropMode || meta.cropMode || 'attention';
     const projectDir = path.join(PROJECTS_DIR, req.params.id);
-    const originalFile = path.join(projectDir, img.originalPath);
-    const croppedFile = path.join(projectDir, img.croppedPath);
+    const learnedPattern = cropMode === 'learned' ? computeLearnedCrop(meta) : null;
+    await cropImageFile(path.join(projectDir, img.originalPath), path.join(projectDir, img.croppedPath), cropMode, learnedPattern);
 
-    let pipeline = sharp(originalFile);
-    if (cropMode === 'contain') {
-      pipeline = pipeline.resize(1024, 1024, {
-        fit: 'contain',
-        background: { r: 0, g: 0, b: 0, alpha: 1 },
-      });
-    } else if (cropMode === 'center') {
-      pipeline = pipeline.resize(1024, 1024, { fit: 'cover', position: 'center' });
-    } else {
-      pipeline = pipeline.resize(1024, 1024, { fit: 'cover', position: 'attention' });
+    img.cropStatus = 'pending'; // 重裁后需要重新审核
+    saveProjectMeta(req.params.id, meta);
+    res.json({ success: true, cropStatus: 'pending' });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// 手动裁剪：用人工框选的方形区域裁剪（x/y/size 均为相对原图的 0–1 比例）
+app.post('/api/projects/:id/images/:imageId/manual-crop', async (req, res) => {
+  try {
+    const meta = getAccessibleProject(req, res);
+    if (!meta) return;
+    const img = meta.images.find(i => i.id === req.params.imageId);
+    if (!img) return res.status(404).json({ error: '图片不存在' });
+
+    const { x, y, size } = req.body || {};
+    if (![x, y, size].every(v => typeof v === 'number' && isFinite(v))) {
+      return res.status(400).json({ error: '裁剪参数不合法' });
     }
-    pipeline = pipeline.jpeg({ quality: 95, mozjpeg: true });
-    await pipeline.toFile(croppedFile);
 
-    res.json({ success: true });
+    const projectDir = path.join(PROJECTS_DIR, req.params.id);
+    const originalFile = path.join(projectDir, img.originalPath);
+    const metadata = await sharp(originalFile).metadata();
+
+    // size 相对短边，换算成像素方形
+    const side = Math.max(32, Math.round(Math.min(metadata.width, metadata.height) * Math.min(1, Math.max(0.05, size))));
+    const maxLeft = metadata.width - side;
+    const maxTop = metadata.height - side;
+    const left = Math.min(maxLeft, Math.max(0, Math.round(metadata.width * x)));
+    const top = Math.min(maxTop, Math.max(0, Math.round(metadata.height * y)));
+
+    await sharp(originalFile)
+      .extract({ left, top, width: side, height: side })
+      .resize(CROP_SIZE, CROP_SIZE, { fit: 'cover' })
+      .withMetadata({ density: CROP_DPI })
+      .jpeg({ quality: 95, mozjpeg: true })
+      .toFile(path.join(projectDir, img.croppedPath));
+
+    // 记录人工裁剪参数（供后续学习裁剪习惯）
+    img.manualCrop = {
+      x: left / metadata.width,
+      y: top / metadata.height,
+      size: side / Math.min(metadata.width, metadata.height),
+      left, top, side,
+      sourceSize: { width: metadata.width, height: metadata.height },
+      updatedAt: new Date().toISOString(),
+    };
+    img.cropStatus = 'pending';
+
+    meta.cropSamples = meta.cropSamples || [];
+    meta.cropSamples.push({
+      imageId: img.id,
+      originalName: img.originalName,
+      aspect: +(metadata.width / metadata.height).toFixed(3),
+      ...img.manualCrop,
+    });
+    if (meta.cropSamples.length > 200) meta.cropSamples = meta.cropSamples.slice(-200);
+
+    saveProjectMeta(req.params.id, meta);
+    res.json({ success: true, manualCrop: img.manualCrop, samples: meta.cropSamples.length });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// 按人工裁剪习惯批量重裁（用最近 N 次人工裁剪的平均取景框）
+app.post('/api/projects/:id/apply-crop-pattern', async (req, res) => {
+  try {
+    const meta = getAccessibleProject(req, res);
+    if (!meta) return;
+    const samples = meta.cropSamples || [];
+    if (!samples.length) return res.status(400).json({ error: '还没有人工裁剪记录，先手动裁几张' });
+
+    const recent = samples.slice(-20);
+    const avgSize = recent.reduce((s, c) => s + c.size, 0) / recent.length;
+    const avgCx = recent.reduce((s, c) => s + (c.x + c.size / 2), 0) / recent.length;
+    const avgCy = recent.reduce((s, c) => s + (c.y + c.size / 2), 0) / recent.length;
+
+    const projectDir = path.join(PROJECTS_DIR, req.params.id);
+    let ok = 0;
+    const failed = [];
+    for (const img of meta.images) {
+      try {
+        const originalFile = path.join(projectDir, img.originalPath);
+        const md = await sharp(originalFile).metadata();
+        const side = Math.round(Math.min(md.width, md.height) * avgSize);
+        const left = Math.min(md.width - side, Math.max(0, Math.round(md.width * (avgCx - avgSize / 2))));
+        const top = Math.min(md.height - side, Math.max(0, Math.round(md.height * (avgCy - avgSize / 2))));
+        await sharp(originalFile)
+          .extract({ left, top, width: side, height: side })
+          .resize(CROP_SIZE, CROP_SIZE, { fit: 'cover' })
+          .withMetadata({ density: CROP_DPI })
+          .jpeg({ quality: 95, mozjpeg: true })
+          .toFile(path.join(projectDir, img.croppedPath));
+        img.cropStatus = 'pending';
+        ok++;
+      } catch (e) {
+        failed.push(img.originalName);
+      }
+    }
+    saveProjectMeta(req.params.id, meta);
+    res.json({ success: true, count: ok, failed, pattern: { size: +avgSize.toFixed(3), cx: +avgCx.toFixed(3), cy: +avgCy.toFixed(3), samples: recent.length } });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// 批量裁剪：默认按项目裁剪方式重裁全部图片；onlyUncropped 时只裁还没裁过的原图
+app.post('/api/projects/:id/recrop-all', async (req, res) => {
+  try {
+    const meta = getAccessibleProject(req, res);
+    if (!meta) return;
+    const projectDir = path.join(PROJECTS_DIR, req.params.id);
+    const cropMode = req.body.cropMode || meta.cropMode || 'attention';
+    const learnedPattern = cropMode === 'learned' ? computeLearnedCrop(meta) : null;
+    const onlyUncropped = req.body.onlyUncropped === true;
+    const targets = onlyUncropped
+      ? meta.images.filter(i => i.cropStatus === 'uncropped')
+      : meta.images;
+
+    let ok = 0;
+    const failed = [];
+    for (const img of targets) {
+      try {
+        await cropImageFile(path.join(projectDir, img.originalPath), path.join(projectDir, img.croppedPath), cropMode, learnedPattern);
+        img.cropStatus = 'pending';
+        ok++;
+      } catch (e) {
+        failed.push(img.originalName);
+      }
+    }
+    saveProjectMeta(req.params.id, meta);
+    res.json({ success: true, count: ok, failed, size: CROP_SIZE, dpi: CROP_DPI });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// 裁剪审核：单张标记 通过 / 需重裁
+app.post('/api/projects/:id/images/:imageId/crop-review', (req, res) => {
+  try {
+    const meta = getAccessibleProject(req, res);
+    if (!meta) return;
+    const img = meta.images.find(i => i.id === req.params.imageId);
+    if (!img) return res.status(404).json({ error: '图片不存在' });
+    const status = req.body.status;
+    if (!['pending', 'ok', 'reject'].includes(status)) {
+      return res.status(400).json({ error: '状态不合法' });
+    }
+    img.cropStatus = status;
+    img.cropReviewedAt = new Date().toISOString();
+    saveProjectMeta(req.params.id, meta);
+    res.json({ success: true, cropStatus: status });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// 裁剪审核：全部标记通过
+app.post('/api/projects/:id/crop-review-all', (req, res) => {
+  try {
+    const meta = getAccessibleProject(req, res);
+    if (!meta) return;
+    const status = req.body.status || 'ok';
+    if (!['pending', 'ok', 'reject'].includes(status)) {
+      return res.status(400).json({ error: '状态不合法' });
+    }
+    const now = new Date().toISOString();
+    for (const img of meta.images) {
+      img.cropStatus = status;
+      img.cropReviewedAt = now;
+    }
+    saveProjectMeta(req.params.id, meta);
+    res.json({ success: true, count: meta.images.length, cropStatus: status });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ============ 智能筛图（AI 质检） ============
+
+const SCREEN_PROMPT = `你是汽车 LoRA 数据集质检员。只针对这一张图判断它能否作为训练素材。
+
+判断标准：
+1. 画面里必须有车（完整车身或车辆局部），不能是无关图片、截图或纯文字图。
+2. 画质可用：不能严重模糊、过曝、欠曝、大面积遮挡或明显压缩噪点。
+3. 不能有明显水印、大面积文字、屏幕截图边框。
+
+同时判断构图类型 shotType：
+- "full"：能看到大部分完整车身（车头、车尾、侧面整车）
+- "detail"：车辆局部特写（车灯、轮毂、后视镜、内饰、格栅等）
+
+只输出一个 JSON，不要解释、不要代码块：
+{"usable": true, "shotType": "full", "issues": [], "reason": "一句话中文理由"}`;
+
+function parseScreenJson(text) {
+  const cleaned = String(text || '').replace(/```json|```/g, '').trim();
+  const start = cleaned.indexOf('{');
+  const end = cleaned.lastIndexOf('}');
+  if (start === -1 || end === -1) throw new Error('返回内容不是 JSON');
+  const obj = JSON.parse(cleaned.slice(start, end + 1));
+  const usable = obj.usable === true || obj.usable === 'true';
+  let shotType = obj.shotType === 'detail' ? 'detail' : 'full';
+  return {
+    usable,
+    shotType,
+    issues: Array.isArray(obj.issues) ? obj.issues : [],
+    reason: obj.reason || '',
+  };
+}
+
+app.post('/api/projects/:id/screen', async (req, res) => {
+  try {
+    const meta = getAccessibleProject(req, res);
+    if (!meta) return;
+    const settings = loadSettings();
+    if (!settings.apiKey) return res.status(400).json({ error: '请先在设置中配置 API Key' });
+    const projectDir = path.join(PROJECTS_DIR, req.params.id);
+
+    const targets = req.body.imageId
+      ? meta.images.filter(i => i.id === req.body.imageId)
+      : meta.images;
+    if (!targets.length) return res.status(400).json({ error: '没有可筛的图片' });
+
+    for (const img of targets) {
+      try {
+        await ensureCropped(meta, req.params.id, img);
+        const raw = await callVisionAPI(path.join(projectDir, img.croppedPath), SCREEN_PROMPT, settings);
+        img.screen = { ...parseScreenJson(raw), screenedAt: new Date().toISOString() };
+        img.shotType = img.screen.shotType;
+      } catch (e) {
+        img.screen = { usable: null, shotType: '', issues: ['screen-failed'], reason: e.message, screenedAt: new Date().toISOString() };
+      }
+    }
+    saveProjectMeta(req.params.id, meta);
+    res.json({ success: true, count: targets.length });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }

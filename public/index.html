@@ -112,9 +112,9 @@
             <button class="btn btn-secondary btn-sm" onclick="openProjectSettings()" title="项目设置">
               <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/><circle cx="5" cy="12" r="1"/></svg>
             </button>
-            <label class="btn btn-primary btn-sm">
-              上传图片
-              <input type="file" multiple accept="image/*" style="display:none" id="fileInput" onchange="handleUpload(this)">
+            <label class="btn btn-primary btn-sm" title="支持多选图片，或直接选一个 zip 图包">
+              上传 / 图包
+              <input type="file" multiple accept="image/*,.zip" style="display:none" id="fileInput" onchange="handleUpload(this)">
             </label>
             <button class="btn btn-secondary btn-sm" onclick="autoCaptionAll()" id="btnAutoCaptionAll" disabled>
               全部打标
@@ -122,8 +122,20 @@
             <button class="btn btn-secondary btn-sm" onclick="verifyAll()" id="btnVerifyAll" disabled>
               全部验证
             </button>
-            <button class="btn btn-success btn-sm" onclick="exportProject()" id="btnExport" disabled>
-              导出
+            <button class="btn btn-secondary btn-sm" onclick="screenAll()" id="btnScreenAll" disabled title="AI 判断图片能否用于训练，并区分整车 / 特写">
+              智能筛图
+            </button>
+            <button class="btn btn-secondary btn-sm" onclick="recropAll()" id="btnRecropAll" disabled title="按项目裁剪方式裁剪全部图片（1024×1024 / 72 DPI / 车居中）">
+              批量裁剪
+            </button>
+            <button class="btn btn-success btn-sm" onclick="exportProject('all')" id="btnExport" disabled>
+              导出全部
+            </button>
+            <button class="btn btn-secondary btn-sm" onclick="exportProject('images')" id="btnExportImages" disabled title="只下载裁剪好的图片（zip）">
+              只导图片
+            </button>
+            <button class="btn btn-secondary btn-sm" onclick="exportProject('captions')" id="btnExportCaptions" disabled title="只下载标词 txt + 中英对照 CSV">
+              只导标词
             </button>
           </div>
         </div>
@@ -154,7 +166,22 @@
             <span class="stat-label">待人工修</span>
             <span class="stat-value" id="statNeedsFix">0</span>
           </div>
+          <div class="stat-item">
+            <span class="stat-label">整车 / 特写</span>
+            <span class="stat-value" id="statShot">0 / 0</span>
+          </div>
+          <div class="stat-item">
+            <span class="stat-label">裁剪待审</span>
+            <span class="stat-value" id="statCropPending">0</span>
+          </div>
+          <div class="stat-item stat-error">
+            <span class="stat-label">建议剔除</span>
+            <span class="stat-value" id="statScreenReject">0</span>
+          </div>
         </div>
+
+        <!-- 数据集构成提示 -->
+        <div class="dataset-tip" id="datasetTip"></div>
 
         <!-- 筛选/过滤栏 -->
         <div class="filter-bar" id="filterBar">
@@ -166,6 +193,11 @@
             <option value="error">有错误</option>
             <option value="verified">已验证</option>
             <option value="missing-part">⚠ 缺部件（需人工补）</option>
+            <option value="crop-pending">未裁剪 / 待审核</option>
+            <option value="crop-reject">裁剪需重裁</option>
+            <option value="screen-reject">建议剔除（AI）</option>
+            <option value="shot-full">整车</option>
+            <option value="shot-detail">特写</option>
           </select>
           <select id="filterSort">
             <option value="default">默认排序</option>
@@ -178,8 +210,8 @@
 
         <!-- 上传区域（拖放） -->
         <div class="upload-zone" id="uploadZone">
-          <p>拖放图片到此处，或点击「上传图片」按钮</p>
-          <p class="hint">支持 JPG / PNG / WebP / BMP，自动裁剪为 1024×1024</p>
+          <p>把图片或 zip 图包拖到这里（拖到页面任意位置都行），或点上方「上传 / 图包」</p>
+          <p class="hint">支持 JPG / PNG / WebP / BMP / ZIP；先原样导入，确认后点「批量裁剪」再裁 1024×1024</p>
         </div>
 
         <!-- 图片网格 -->
@@ -214,6 +246,7 @@
           <label>默认裁剪模式</label>
           <select id="settingsCropMode">
             <option value="attention">智能裁剪（基于显著性检测，推荐）</option>
+            <option value="learned">学习我的裁剪（按项目手动样本）</option>
             <option value="center">中心裁剪</option>
             <option value="contain">包含模式（填充黑边，保留完整画面）</option>
           </select>
@@ -244,8 +277,13 @@
         </div>
         <div class="form-group">
           <label>触发词 (Trigger Word)</label>
-          <input type="text" id="newProjectTrigger" placeholder="例如：sks person">
-          <small>LoRA 训练用的触发词，导出时自动添加到标语前</small>
+          <input type="text" id="newProjectTrigger" placeholder="例如：sks person / GLC">
+          <small>LoRA 训练用的触发词，导出时自动添加到标语前；汽车一般是车型缩写</small>
+        </div>
+        <div class="form-group">
+          <label>车名 / 车型</label>
+          <input type="text" id="newProjectCarName" placeholder="例如：LS6">
+          <small>汽车模板专用。填具体车型名，打标时按此名称识别车牌/铭牌文字；留空则只用触发词</small>
         </div>
         <div class="form-group">
           <label>打标模板</label>
@@ -259,6 +297,7 @@
           <label>裁剪模式</label>
           <select id="newProjectCrop">
             <option value="attention">智能裁剪（推荐）</option>
+            <option value="learned">学习我的裁剪（按手动样本，需已有手动裁剪记录）</option>
             <option value="center">中心裁剪</option>
             <option value="contain">包含模式（填充黑边）</option>
           </select>
@@ -292,6 +331,10 @@
           <input type="text" id="editProjectTrigger">
         </div>
         <div class="form-group">
+          <label>车名 / 车型</label>
+          <input type="text" id="editProjectCarName" placeholder="例如：LS6">
+        </div>
+        <div class="form-group">
           <label>打标模板</label>
           <select id="editProjectTemplate">
             <option value="general">通用模板</option>
@@ -302,6 +345,7 @@
           <label>裁剪模式</label>
           <select id="editProjectCrop">
             <option value="attention">智能裁剪（推荐）</option>
+            <option value="learned">学习我的裁剪（按本项目手动样本）</option>
             <option value="center">中心裁剪</option>
             <option value="contain">包含模式（填充黑边）</option>
           </select>
@@ -327,6 +371,31 @@
       </div>
       <div class="modal-body" id="imageDetailBody">
         <!-- 动态内容 -->
+      </div>
+    </div>
+  </div>
+
+  <!-- 手动裁剪弹窗 -->
+  <div class="modal-overlay" id="cropModal" style="display:none;">
+    <div class="modal modal-large">
+      <div class="modal-header">
+        <h3 id="cropModalTitle">手动裁剪</h3>
+        <button class="btn-close" onclick="closeModal('cropModal')">✕</button>
+      </div>
+      <div class="modal-body">
+        <p class="crop-hint">拖动方框选择裁剪区域（锁定 1:1），让车居中在框内。点右下角「确认保存裁剪」生效，输出 1024×1024 / 72 DPI。</p>
+        <div class="crop-stage" id="cropStage">
+          <img id="cropImage" draggable="false" alt="原图">
+          <div class="crop-box" id="cropBox">
+            <div class="crop-handle" data-handle="br"></div>
+          </div>
+        </div>
+      </div>
+      <div class="modal-footer crop-footer">
+        <span id="cropInfo" class="crop-info"></span>
+        <button class="btn btn-secondary btn-sm" onclick="resetCropBox()">重置</button>
+        <button class="btn btn-secondary btn-sm" onclick="applyCropPattern()">套用我的裁剪习惯</button>
+        <button class="btn btn-success" onclick="saveManualCrop()">✓ 确认保存裁剪</button>
       </div>
     </div>
   </div>
