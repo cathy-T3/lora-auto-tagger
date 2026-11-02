@@ -60,10 +60,10 @@ curl -s -c /tmp/ft.jar -H 'Content-Type: application/json' \
 node scripts/tags.js <projectId> add 10-30 --tags "door handle=车门把手" --apply
 node scripts/tags.js <projectId> set-view 49-54 --view "right rear 45 view=右后45度视角" --apply
 node scripts/tags.js <projectId> keep 73-82 --tags "white painted=白色涂装,license plate=车牌" --apply
-node scripts/tags.js <projectId> normalize --apply
+node scripts/tags.js <projectId> normalize --apply   # 不给范围时修全部
 ```
 
-改完先抽查 1–2 张英文与中文，再向用户汇报命中率（如 `6/6`）。
+`normalize` 会自动把视角挪到第 2 位、去重、统一中文用词并以 `motor vehicle` / `机动车` 收尾；报告的改动数只统计英文变化，纯中文修正也会写入但仍显示 0。改完先抽查 1–2 张英文与中文，再向用户汇报命中率（如 `6/6`）。
 
 ## 导出
 
@@ -76,7 +76,7 @@ node scripts/tags.js <projectId> normalize --apply
 
 1. 触发词重复：标语已以触发词开头时不要再拼 `LS6 LS6, ...`
 2. 涂装不一致：Prompt 硬规则 + `normalizeCarColors()` 兜底，中文同步「白色涂装」
-3. 中文用词：`前格栅`、`车门把手`、`车铭牌`、`车标`、`机动车`；避免「车车门把手」
+3. 中文用词：`前格栅`、`车门把手`、`车铭牌`、`车标`、`前大灯`、`机动车`；避免「车车门把手」「车把手」「名牌」「大灯」
 4. 视角标签必须在第 2 位，改词后要重排
 5. 前端曾用 `apiKey.includes('****')` 判断未配置导致不打标，判断请用后端 `apiKeyConfigured`
 6. 拖拽不生效时先刷新页面，再检查是否落在 window 级 drop 监听内

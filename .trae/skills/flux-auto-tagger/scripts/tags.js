@@ -18,12 +18,16 @@ const VIEWS_ZH = [
   '左后45度视角', '右后45度视角', '后视图',
 ];
 
-const [projectId, action, rangeArg, ...rest] = process.argv.slice(2);
-const apply = rest.includes('--apply');
+const rawArgs = process.argv.slice(2);
+const apply = rawArgs.includes('--apply');
 const opts = {};
-for (let i = 0; i < rest.length; i++) {
-  if (rest[i].startsWith('--') && rest[i] !== '--apply') opts[rest[i].slice(2)] = rest[i + 1];
+const positionals = [];
+for (let i = 0; i < rawArgs.length; i++) {
+  const a = rawArgs[i];
+  if (a === '--apply') continue;
+  if (a.startsWith('--')) { opts[a.slice(2)] = rawArgs[i + 1]; i++; } else positionals.push(a);
 }
+const [projectId, action, rangeArg] = positionals;
 if (!projectId || !action) {
   console.error('用法见文件头注释');
   process.exit(1);
@@ -78,7 +82,11 @@ function normalize(img) {
   const vZh = zh.find(t => VIEWS_ZH.includes(t));
   en = en.filter(t => !VIEWS_EN.includes(t) && t !== 'motor vehicle');
   zh = zh.filter(t => !VIEWS_ZH.includes(t) && t !== '机动车' && t !== '机动车辆');
-  zh = zh.map(t => ({ '汽车标志': '车标', '铭牌': '车铭牌', '车车铭牌': '车铭牌', '前中网': '前格栅', '车车门把手': '车门把手' }[t] || t));
+  zh = zh.map(t => ({
+    '汽车标志': '车标', '铭牌': '车铭牌', '名牌': '车铭牌', '车车铭牌': '车铭牌',
+    '前中网': '前格栅', '车车门把手': '车门把手', '车把手': '车门把手', '把手': '车门把手',
+    '大灯': '前大灯',
+  }[t] || t));
   en = [...new Set(en)];
   zh = [...new Set(zh)];
   const trigger = en.shift() || '';
@@ -88,7 +96,8 @@ function normalize(img) {
   img.captionZh = join(tailZh);
 }
 
-const targets = parseRanges(rangeArg);
+// 不给范围时：normalize 处理全部，其他动作必须给范围
+const targets = rangeArg ? parseRanges(rangeArg) : action === 'normalize' ? meta.images.map((_, i) => i + 1) : [];
 const preview = [];
 
 for (const n of targets) {
